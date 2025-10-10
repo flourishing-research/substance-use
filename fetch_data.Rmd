@@ -1,0 +1,100 @@
+---
+title: "Substance Abuse Meta-analysis"
+output: html_notebook
+---
+
+```{r}
+install.packages("googlesheets4")
+install.packages('tidyverse')
+install.packages('meta')
+install.packages('gridExtra')
+```
+
+```{r}
+library(tidyverse)
+library(googlesheets4)
+library(meta)
+library(openssl)
+library(gridExtra)
+```
+
+```{r}
+# Read the Google Sheet
+gs4_deauth() # we don't need oauth
+sheet_url = "https://docs.google.com/spreadsheets/d/1sVnWATZVDbF4_wmcV-MsRDrZt17JWYTUVkArWPP4Kz8/edit#gid=0"
+data <- read_sheet(sheet_url, sheet = "Final")
+df <- data
+df <- df %>%  mutate(SheetRowNumber = row_number() + 1)
+df$id <- paste(df$AuthorYear, "-", df$SheetRowNumber)
+df$id_masked <- factor(substr(md5(df$id), 1, 6))
+```
+
+# Summary Tables of Extract Effect Counts
+```{r}
+result_table <- df %>%
+  filter(Include == 'yes') %>%
+  count(OutcomeType, OutcomeSubType,  name = "Count") %>%  # Count unique tuples
+  arrange(OutcomeType, OutcomeSubType, desc(Count))  # Sort the table
+
+# View the result
+print(result_table)
+
+```
+
+# Recode groups
+```{r}
+df$ToInvert[is.na(df$ToInvert)]<- FALSE # Set nulls to false
+df$OutcomeSubType[df$OutcomeSubType == 'Frequent binge drinking']<- 'Alcohol'
+df$OutcomeSubType[df$OutcomeSubType == 'Hard Drugs']<- 'Drugs'
+df$OutcomeSubType[df$OutcomeSubType == 'Other Illicit Drug']<- 'Drugs'
+```
+
+
+# Substance Use
+# We shouldn't need this anymore
+```{r Select Substance Use Outcomes}
+df.substance <- df %>%
+  filter(Include == 'yes', 
+         OutcomeType == 'Substance Use'
+)
+
+```
+
+# Make sure we don't have more than 1 exposure-outcome pair per paper
+```{r}
+# Group by AuthorYear, Exposure, and OutcomeSubType, then count the occurrences
+df_duplicates <- df.substance %>%
+  group_by(AuthorYear, Exposure, OutcomeSubType) %>%
+  tally() %>%
+  filter(n > 1)
+
+# Check if there are any duplicate exposure-outcome pairs
+if (nrow(df_duplicates) > 0) {
+  print("There are duplicate exposure-outcome pairs:")
+  print(df_duplicates)
+} else {
+  print("No duplicate exposure-outcome pairs found.")
+}
+
+```
+
+# Deal with the Marijuana + Drug Labelling Overlap Issue
+```{r}
+# Define the substances of interest
+substances_of_interest <- c("Marijuana", "Drugs", "Alcohol + Marijuana Combined", "All Substances", "Combined")
+
+# Filter the data frame to include only the rows with the specified OutcomSubType values
+df_filtered <- df.substance[df.substance$OutcomeSubType %in% substances_of_interest, ]
+
+# Group by AuthorYear and count distinct OutcomeSubType occurrences
+df_result <- df_filtered %>%
+  group_by(AuthorYear) %>%
+  summarise(distinct_substances = n_distinct(OutcomeSubType)) %>%
+  filter(distinct_substances >= 2) %>%
+  select(AuthorYear)
+
+# View the result
+print(df_result)
+
+```
+

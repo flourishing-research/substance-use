@@ -1,0 +1,233 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+install.packages("googlesheets4")
+install.packages('tidyverse')
+install.packages('meta')
+install.packages('gridExtra')
+```
+
+```{r}
+library(tidyverse)
+library(googlesheets4)
+library(meta)
+library(openssl)
+library(gridExtra)
+```
+
+```{r}
+# Read the Google Sheet
+gs4_deauth() # we don't need oauth
+sheet_url = "https://docs.google.com/spreadsheets/d/1sVnWATZVDbF4_wmcV-MsRDrZt17JWYTUVkArWPP4Kz8/edit#gid=0"
+data <- read_sheet(sheet_url)
+df <- data
+df <- df %>%  mutate(SheetRowNumber = row_number() + 1)
+df$id <- paste(df$AuthorYear, "-", df$SheetRowNumber)
+df$id_masked <- factor(substr(md5(df$id), 1, 6))
+```
+
+# Transformations
+```{r}
+
+toConvertFromBtoOR = c('Chu and Sung 2009', 'Chu 2012', 'Desmond et al. 2013')
+
+# Chu 2012 reported unstandardized b. Take exp(b) to get OR.
+df <- df %>%
+  mutate(
+    Stat = ifelse(AuthorYear %in% toConvertFromBtoOR & StatType == 'b', exp(Stat), Stat),
+#    SE = ifelse(AuthorYear %in% toConvertFromBtoOR & StatType == 'b', exp(SE), SE),
+    StatType = ifelse(AuthorYear %in% toConvertFromBtoOR & StatType == 'b', 'OR', StatType)
+  )
+
+```
+
+# Transformations - Reverse Code (if needed)
+```{r}
+# Improve this, use the `need to invert` value
+rowsToReverse = c(69, 77, 322, 324, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349, 350, 351, 352, 353, 354, 355 , 356 , 357 , 478, 519, 520, 575, 576, 582, 583)
+
+# Invert 'Stat' and 'CILow', 'CIHigh' for specified rows
+df <- df %>%
+  mutate(
+    Stat = if_else(SheetRowNumber %in% rowsToReverse, 1 / Stat, Stat),
+    CILow = if_else(SheetRowNumber %in% rowsToReverse, 1 / CIHigh, CILow),
+    CIHigh = if_else(SheetRowNumber %in% rowsToReverse, 1 / CILow, CIHigh)
+  )
+
+```
+
+# Summary Tables of Extract Effect Counts
+```{r}
+result_table <- df %>%
+  filter(Include == 'yes') %>%  # Keep only rows where Include is 'yes'
+  filter(OutcomeType == 'Substance Use') %>%
+# count(OutcomeType, OutcomeSubType, OutcomeScale, name = "Count") %>%  # Count unique tuples
+  count(OutcomeType, OutcomeScale, ExposureCategory, name = "Count") %>%  # Count unique tuples
+  arrange(OutcomeType, OutcomeScale, desc(Count))  # Sort the table
+
+# View the result
+print(result_table)
+
+tableGrob <- tableGrob(result_table, rows = NULL, theme = ttheme_minimal())
+
+# Plot the table using grid.arrange() and then save it as an image
+png("publication_table.png", width = 600, height = 1000)
+grid.arrange(tableGrob)
+```
+
+# RSA + R/S Dichotomous Outcomes 
+```{r}
+df.substance.di <- df %>%
+  filter(Include == 'yes', 
+         OutcomeType == 'Substance Use',
+         OutcomeScale == 'Dichotomous'
+)
+
+```
+
+
+
+# RSA Dichotomous Outcomes
+```{r}
+# Religious Service Attendance (RSA)
+
+# Dichotomous Outcomes
+df.rsa <- df %>%
+  filter(ExposureCategory == 'RSA', 
+         Include == 'yes', 
+#        StatType == 'OR' | StatType == 'AOR', 
+         OutcomeType == 'Substance Use',
+         OutcomeScale == 'Dichotomous'
+)
+
+df.rsa <- df.rsa %>%
+  mutate(
+    CILow = ifelse(is.na(CILow), Stat - 2 * SE, CILow),
+    CIHigh = ifelse(is.na(CIHigh), Stat + 2 * SE, CIHigh)
+  )
+#df.rsa <- df.rsa %>%
+  #mutate(
+    #CILow = ifelse(is.na(CILow), Stat, CILow),
+    #CIHigh = ifelse(is.na(CIHigh), Stat, CIHigh)
+  #)
+
+# if we still don't have a CI, create 10% ones
+df.rsa <- df.rsa %>%
+  mutate(
+    CIPercentLow = ifelse(!is.na(CILow), (Stat - CILow) / Stat * 100, NA),
+    CIPercentHigh = ifelse(!is.na(CIHigh), (CIHigh - Stat) / Stat * 100, NA)
+  )
+avg_percent_low <- mean(df.rsa$CIPercentLow, na.rm = TRUE)
+avg_percent_high <- mean(df.rsa$CIPercentHigh, na.rm = TRUE)
+median_percent_low <- median(df.rsa$CIPercentLow, na.rm = TRUE)
+median_percent_high <- median(df.rsa$CIPercentHigh, na.rm = TRUE)
+#df.rsa <- df.rsa %>%
+#  mutate(
+#    CILow = ifelse(is.na(CILow), Stat - Stat * (median_percent_low / 100), CILow),
+#    CIHigh = ifelse(is.na(CIHigh), Stat + Stat * (median_percent_high / 100), CIHigh)
+#  )
+
+ggplot(df.rsa, aes(x = Stat, ymin = CILow, ymax = CIHigh, y = id_masked )) +
+  geom_vline(xintercept = 1, color = "gray", size = 1.1, linetype = "solid") + # Add vertical line for null effect
+  geom_point() + # Plot the effect sizes as points
+  geom_errorbarh(aes(xmin = CILow, xmax = CIHigh), height = 0.2) + # Add horizontal error bars for CI
+  theme_minimal() +
+  labs(x = "Effect Size", y = "Study", title = "RSA Substance Use Dichotomous Effect Sizes (OR)") +
+  theme(axis.title.y = element_blank()) # Removing Y axis title for clarity
+
+
+```
+
+# RSA Frequency Outcomes
+```{r}
+df.rsa.freq <- df %>%
+  filter(ExposureCategory == 'RSA', 
+         Include == 'yes', 
+#         StatType == 'OR' | StatType == 'AOR', 
+         OutcomeType == 'Substance Use',
+         OutcomeScale == 'Frequency')
+
+df.rsa.freq <- df.rsa.freq %>%
+  mutate(
+    CILow = ifelse(is.na(CILow), Stat - 2 * SE, CILow),
+    CIHigh = ifelse(is.na(CIHigh), Stat + 2 * SE, CIHigh)
+  )
+```
+
+# R/S Dichotomous Outcomes
+```{r}
+# Religious/Spiritual (SA) Omnibus Category (Excludes RSA)
+
+# Frequency Outcomes
+df.rs <- df %>%
+  filter(ExposureCategory == 'R/S', 
+         Include == 'yes', 
+         StatType == 'OR' | StatType == 'AOR', 
+         OutcomeType == 'Substance Use',
+         OutcomeScale == 'Dichotomous')
+
+df.rs <- df.rs %>%
+  mutate(
+    CILow = ifelse(is.na(CILow), Stat - 2 * SE, CILow),
+    CIHigh = ifelse(is.na(CIHigh), Stat + 2 * SE, CIHigh)
+  )
+
+ggplot(df.rs, aes(x = Stat, ymin = CILow, ymax = CIHigh, y = id_masked )) +
+  geom_vline(xintercept = 1, color = "gray", size = 1.1, linetype = "solid") + # Add vertical line for null effect
+  geom_point() + # Plot the effect sizes as points
+  geom_errorbarh(aes(xmin = CILow, xmax = CIHigh), height = 0.2) + # Add horizontal error bars for CI
+  theme_minimal() +
+  labs(x = "Effect Size", y = "Study", title = "R/S Substance Use Dichotomous Effect Sizes (OR)") +
+  theme(axis.title.y = element_blank()) # Removing Y axis title for clarity
+
+```
+
+# R/S Frequency Outcomes
+```{r}
+df.rs.freq <- df %>%
+  filter(ExposureCategory == 'R/S', 
+         Include == 'yes', 
+#         StatType == 'OR' | StatType == 'AOR', 
+         OutcomeType == 'Substance Use',
+         OutcomeScale == 'Frequency')
+
+df.rsa.freq <- df.rsa.freq %>%
+  mutate(
+    CILow = ifelse(is.na(CILow), Stat - 2 * SE, CILow),
+    CIHigh = ifelse(is.na(CIHigh), Stat + 2 * SE, CIHigh)
+  )
+```
+
+
+
+```{r}
+# meta fun
+
+d<- df_rsa%>% select(X, Stat, CILow, CIHigh, SE)
+
+help(forest)
+forest(Stat, data=d)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
