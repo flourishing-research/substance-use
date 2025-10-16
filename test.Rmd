@@ -1,0 +1,1228 @@
+# Tests ########################################################################
+
+
+# Load Packages
+```{r}
+library(tidyverse)
+library(googlesheets4)
+library(meta)
+library(openssl)
+library(gridExtra)
+library(metafor)
+library(robumeta)
+library(knitr)
+library(stargazer)
+library(weightr)
+library(MetaUtility)
+```
+
+# Religion (trt) should be _protective_ and, therefore, we should expect
+# non-negative values
+
+```{r Data}
+d.converted<- subset(d, d$vi != 'NA')
+d.converted<- d
+d.converted <- d.converted %>% arrange(yi) # sort by point estimate
+#d.converted <- d.converted %>% arrange(vi) # sort by variance
+
+# Filter out problematic papers (for now)
+# Mendolia et al. 2019
+# Vogelsang and Lariscy 2020
+d.converted <- d.converted %>% filter(authoryear != 'Mendolia et al. 2019')
+d.converted <- d.converted %>% filter(authoryear != 'Vogelsang and Lariscy 2020')
+
+```
+
+# Create data frames (all, by outcome)
+```{r}
+# All
+d.all <- d.converted
+d.all <- d.all %>% filter( !(authoryear == 'Burdette et al. 2018' & substudy == 'Marijuana') )
+d.all <- d.all %>% filter( !(authoryear == 'Hodge et al. 2021' & substudy == 'Marijuana') ) 
+d.all <- d.all %>% filter( !(authoryear == 'Mak 2019' & substudy == 'Marijuana') ) 
+
+# Alcohol
+d.alcohol <- d.converted %>% filter(substudy == 'Alcohol')
+
+# Smoking
+d.smoking <- d.converted %>% filter(substudy == 'Smoking')
+
+# Drugs
+d.drugs <- d.converted %>% filter(substudy == 'Drugs')
+
+# Marijuana
+d.marijuana <- d.converted %>% filter(substudy == 'Marijuana')
+
+```
+
+# Descriptive Statistics
+```{r}
+# Outcome Counts - Extracted
+outcome_counts_extracted <- df.substance %>%
+  count(OutcomeSubType) %>%
+  rename(Extracted = n)
+
+# Outcome Counts - Used
+outcome_counts_used <- d.converted %>%
+  count(substudy) %>%
+  rename(Used = n)
+
+# Combine into a single table, matching by Outcome/Substudy
+table2 <- full_join(outcome_counts_extracted, outcome_counts_used, 
+                    by = c("OutcomeSubType" = "substudy")) %>%
+  rename(Outcome = OutcomeSubType) %>%
+  arrange(Outcome)
+
+# Generate the Markdown table text for Table 2
+markdown_table2 <- kable(
+  table2, 
+  format = "markdown", 
+  align = c("l", "r", "r")
+)
+
+# Add explicit newlines for proper formatting
+markdown_table2_text <- paste0(markdown_table2, collapse = "\n")
+
+# Ensure newlines after each row
+markdown_table2_text <- gsub("\\n", "\n", markdown_table2_text)
+
+# Print Table 2 with proper newlines
+cat(markdown_table2_text, "\n")
+```
+
+```{r}
+# Missing Error Terms
+missing_error_terms <- df.substance %>%
+  summarise(True = sum(is.na(SE) & is.na(CIHigh)),
+            False = sum(!is.na(SE) | !is.na(CIHigh))) %>%
+  mutate(Category = "Missing Error Terms")
+
+# Preventative vs Recovery
+preventative_recovery <- df.substance %>%
+  mutate(Preventative = grepl('prevent', PreventativeOrRecovery)) %>%
+  count(Preventative) %>%
+  tidyr::complete(Preventative = c(TRUE, FALSE), fill = list(n = 0)) %>%
+  spread(Preventative, n) %>%
+  rename(True = `TRUE`, False = `FALSE`) %>%
+  mutate(Category = "Preventative")
+
+# Headline in Abstract
+headline_in_abstract <- df.substance %>%
+  mutate(headline = grepl('yes', `Finding In Abstract?`)) %>%
+  count(headline) %>%
+  tidyr::complete(headline = c(TRUE, FALSE), fill = list(n = 0)) %>%
+  spread(headline, n) %>%
+  rename(True = `TRUE`, False = `FALSE`) %>%
+  mutate(Category = "Headline")
+
+# Combine into a single table
+table1 <- bind_rows(missing_error_terms, preventative_recovery, headline_in_abstract) %>%
+  select(Category, True, False)
+
+# Generate the Markdown table text for Table 1
+markdown_table1 <- kable(
+  table1, 
+  format = "markdown", 
+  align = c("l", "r", "r")
+)
+
+# Add explicit newlines for proper formatting
+markdown_table1_text <- paste0(markdown_table1, collapse = "\n")
+
+# Ensure newlines after each row
+markdown_table1_text <- gsub("\\n", "\n", markdown_table1_text)
+
+# Print Table 1 with proper newlines
+cat(markdown_table1_text, "\n")
+
+```
+
+
+
+# Basic Descriptive Values - Include Errors?
+```{r Basic Descriptive Statistics}
+# Missing Error Terms
+df.substance %>% filter(is.na(SE) & is.na(CIHigh)) %>% count()
+df.substance %>% filter(!is.na(SE) | !is.na(CIHigh)) %>% count()
+
+# Preventative vs Recovery
+df.substance$Preventative <- grepl('prevent', df.substance$PreventativeOrRecovery)
+result_table <- df.substance %>%
+ count( Preventative,  name = "Count")
+print(result_table)
+
+# Headline
+df.substance$headline <- grepl('yes', df.substance$`Finding In Abstract?`)
+result_table <- df.substance %>%
+ count( headline,  name = "Count")
+print(result_table)
+
+# Outcome Counts - Extracted
+result_table <- df.substance %>%
+ count(OutcomeSubType, OutcomeSubType,  name = "Count") %>%  # Count unique tuples
+  arrange(OutcomeSubType, OutcomeSubType, desc(Count))  # Sort the table
+print(result_table)
+# Outcome Counts - Used
+result_table <- d.converted %>%
+ count(substudy, substudy,  name = "Count") %>%  # Count unique tuples
+  arrange(substudy, substudy, desc(Count))  # Sort the table
+print(result_table)
+
+```
+
+# Forest Plots by Outcome
+```{r Forest Plots by Outcome}
+# Ensure the subgroup variable is a factor
+d.converted$subgroup <- as.factor(d.converted$substudy)
+
+# Get unique subgroups
+unique_subgroups <- unique(d.converted$subgroup)
+
+# Set up a 2x2 plotting area
+par(mfrow = c(2, 2)) # 2 rows, 2 columns
+par(mar = c(5, 5, 2, 5) + 0.1) # Adjusted margins for better spacing
+par(cex = 0.8) # Increase text size for better readability
+
+# Loop over subgroups and create a forest plot for each
+for (grp in unique_subgroups) {
+  subset_data <- d.converted[d.converted$subgroup == grp, ]
+  
+  # Extract effect sizes and variances for the subgroup
+  effect_sizes <- subset_data$yi
+  variances <- subset_data$vi
+  study_labels <- subset_data$authoryear
+  
+  # Calculate confidence intervals
+  ci.lb <- effect_sizes - 1.96 * sqrt(variances)
+  ci.ub <- effect_sizes + 1.96 * sqrt(variances)
+  
+  # Create the forest plot for the subgroup with reversed vertical ordering
+  forest(x = effect_sizes, vi = variances, slab = study_labels,
+         xlab = "", 
+         main = grp,
+         alim = c(-4, 4), # Set x-axis limits to -4, 4
+         at = seq(-4, 4, by = 1), # Set ticks at uniform intervals
+         cex.lab = 1.2, # Increase the label size
+         cex.axis = 0.5, # Increase the axis size
+         rows = length(effect_sizes):1, # Reverse the order of the rows
+         psize = 1.0, # Increase point size
+         ilab.xpos = -4, # Position the labels closer to the plot
+         xlim = c(-6, 6), # Extend xlim to give more space for labels
+         digits = 2) # Limit the number of digits shown
+}
+
+# Reset the plotting area to single panel (if needed later)
+par(mfrow = c(1, 1))
+```
+
+
+# Omnibus Random-effects model
+```{r Fit random-effects model}
+result <- rma(
+  yi,  # Log-transformed RRs
+  vi,  # Variances of the log-transformed RRs
+  data = d.all,
+  method = "REML"  # For random-effects model
+)
+summary(result) # Summary of the meta-analysis results
+
+
+# Extract key statistics from the rma model
+estimate <- formatC(result$b, format = "fg", digits = 3)
+stderr <- formatC(result$se, format = "fg", digits = 3)
+p_value <- ifelse(result$pval < 0.001, "<0.001", formatC(result$pval, format = "e", digits = 2))
+ci_lower <- formatC(result$ci.lb, format = "fg", digits = 3)
+ci_upper <- formatC(result$ci.ub, format = "fg", digits = 3)
+
+# Model-level statistics
+tau_sq <- formatC(result$tau2, format = "fg", digits = 3)
+i2 <- formatC(result$I2, format = "fg", digits = 1)
+num_outcomes <- result$k  # Number of studies
+num_clusters <- "N/A"  # Not directly available in rma but could represent num_outcomes
+
+# Create the inline text
+inline_text <- paste0(
+  "est = ", estimate, " (", ci_lower, ", ", ci_upper, "), ",
+  "se = ", stderr, ", p = ", p_value, 
+  ", I^2 = ", i2, ", \\tau^2 = ", tau_sq, 
+  ", n = ", num_outcomes
+)
+
+# Print the inline text for markdown
+cat(inline_text, "\n")
+
+# Extract key statistics
+estimate <- result$b
+
+# Exponentiate the estimate
+exp_estimate <- exp(estimate)
+
+# Format the result for printing
+formatted_estimate <- formatC(estimate, format = "fg", digits = 4)  # Rounded to 4 digits
+formatted_exp_estimate <- formatC(exp_estimate, format = "fg", digits = 2)  # Rounded to 2 digits
+
+# Create the standalone text for the exponentiated estimate
+exp_text <- paste0("exp(", formatted_estimate, ") = ", formatted_exp_estimate)
+
+# Print the standalone exponentiated estimate
+cat(exp_text, "\n")
+
+# Extract heterogeneity statistics
+Q_stat <- formatC(result$QE, format = "fg", digits = 4)  # Q statistic
+Q_df <- result$k - 1  # Degrees of freedom (df = number of studies - 1)
+Q_pval <- ifelse(result$QEp < 0.001, "<.0001", formatC(result$QEp, format = "fg", digits = 4))  # p-value for Q
+
+# Extract tau^2 and its SE
+tau_sq <- formatC(result$tau2, format = "fg", digits = 4)  # tau^2
+tau_sq_se <- formatC(result$se.tau2, format = "fg", digits = 4)  # SE of tau^2
+
+# Print the heterogeneity stats for easy copying
+heterogeneity_text <- paste0("Q(df = ", Q_df, ") = ", Q_stat, ", p-val = ", Q_pval)
+tau_sq_text <- paste0("tau^2 = ", tau_sq, " (SE = ", tau_sq_se, ")")
+
+# Print the heterogeneity results separately
+cat(heterogeneity_text, "\n")
+cat(tau_sq_text, "\n")
+
+```
+
+
+# Omnibu Robust Meta
+```{r}
+( meta.rob = robu( yi ~ 1, 
+                   data = d.all, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+
+# Print results to show inline in the article 
+num_clusters <- meta.rob$N
+num_outcomes <- meta.rob$M
+omega_sq <- formatC(meta.rob$mod_info$omega.sq, format = "fg", digits = 2)
+tau_sq <- formatC(meta.rob$mod_info$tau.sq, format = "fg", digits = 2)
+
+# Extract regression table results
+estimate <- formatC(meta.rob$reg_table$b.r, format = "fg", digits = 3)
+stderr <- formatC(meta.rob$reg_table$SE, format = "fg", digits = 3)
+p_value <- ifelse(meta.rob$reg_table$prob < 0.001, "<0.001", formatC(meta.rob$reg_table$prob, format = "e", digits = 2))
+ci_lower <- formatC(meta.rob$reg_table$CI.L, format = "fg", digits = 3)
+ci_upper <- formatC(meta.rob$reg_table$CI.U, format = "fg", digits = 3)
+
+# Create the inline text
+inline_text <- paste0(
+  "est = ", estimate, " (", ci_lower, ", ", ci_upper, "), ",
+  "se = ", stderr, ", p = ", p_value, 
+  ", \\omega^2 = ", omega_sq, ", \\tau^2 = ", tau_sq, 
+  ", n = ", num_outcomes, ", k = ", num_clusters
+)
+
+# Print the inline text
+cat(inline_text, "\n")
+```
+
+# Main Figure: Make forest plot for omnibus meta robust results
+```{r}
+library(metafor)
+
+# Sort the data in descending order by effect size
+d.all <- d.all[order(d.all$yi, decreasing = TRUE), ]
+
+# Extract necessary data for the forest plot
+effect_sizes <- d.all$yi
+variances <- d.all$vi
+study_labels <- d.all$authoryear
+
+# Calculate confidence intervals
+ci.lb <- effect_sizes - 1.96 * sqrt(variances)
+ci.ub <- effect_sizes + 1.96 * sqrt(variances)
+
+# Extract overall mean effect size and its confidence interval
+mean_effect <- meta.rob$reg_table$b.r
+mean_ci.lb <- meta.rob$reg_table$CI.L
+mean_ci.ub <- meta.rob$reg_table$CI.U
+
+# Set the output to a PNG file with appropriate dimensions
+png("omnibus-robu-meta-forest-final.png", width = 8.5, height = 11, units = "in", res = 300)  
+
+# Adjust the margins and set smaller text sizes
+par(mar = c(4, 4, 0, 2))  # Bottom, Left, Top, Right
+
+# Create the forest plot with optimized spacing and smaller text sizes
+forest(effect_sizes, vi = variances, slab = study_labels,
+       xlab = "Effect Size", 
+       alim = c(min(ci.lb, mean_ci.lb), max(ci.ub, mean_ci.ub)),
+       xlim = c(min(ci.lb, mean_ci.lb) - 1.5, max(ci.ub, mean_ci.ub) + 1.5),  # Increased space around plot
+       cex = 0.4,  # Smaller text size for study labels
+       psize = 0.8,  # Smaller point size
+       ilab = cbind(format(round(ci.lb, 2)), format(round(ci.ub, 2))),  # Add CI labels
+       ilab.xpos = c(min(ci.lb, mean_ci.lb) - 2, max(ci.ub, mean_ci.ub) + 2),  # More space for CI labels
+       ilab.pos = 2,  # Position of the labels relative to the plot
+       header = "Study",
+       ylim = c(0, length(effect_sizes) + 4))  # Adjust vertical space for better fit
+
+# Add a polygon to represent the overall effect size and confidence interval
+addpoly(mean_effect, ci.lb = mean_ci.lb, ci.ub = mean_ci.ub, 
+        rows = 0, cex = 0.4, mlab = "Overall Mean Effect", col = "gray")
+
+# Add the vertical line at the null effect (0)
+abline(v = 0, lty = 2, col = "red")
+
+# Close the PNG device to save the plot
+dev.off()
+```
+
+
+# Omnibus Funnel Plots & Test
+```{r}
+# Extract effect sizes and standard errors directly from the data
+effect_sizes <- d.converted$yi
+standard_errors <- sqrt(d.converted$vi)
+
+# Identify non-outlier data (SE <= 0.5)
+non_outliers <- standard_errors <= 0.5
+
+# Create a two-panel figure
+png("two_panel_funnel_plot.png", width = 12, height = 6, units = "in", res = 300)
+par(mfrow = c(1, 2))  # Set up a 1x2 plotting area
+
+# Panel A: Funnel plot with all data
+funnel(effect_sizes, sei = standard_errors, 
+       ylab = "Standard Error", xlab = "Effect Size", 
+       main = "",  # No title
+       pch = 19,  # Solid circles
+       col = "black",  # Black points
+       cex = 0.7,  # Reduce point size
+       cex.lab = 0.8,  # Reduce label size
+       cex.axis = 0.7)  # Reduce axis text size
+
+# Panel B: Funnel plot without outliers (SE > 0.5)
+funnel(effect_sizes[non_outliers], sei = standard_errors[non_outliers], 
+       ylab = "Standard Error", xlab = "Effect Size", 
+       main = "",  # No title
+       pch = 19,  # Solid circles
+       col = "black",  # Black points
+       cex = 0.7,  # Reduce point size
+       cex.lab = 0.8,  # Reduce label size
+       cex.axis = 0.7)  # Reduce axis text size
+
+# Close the PNG device to save the plot
+dev.off()
+```
+
+# Egger's Test
+```{r}
+rma_model <- rma(yi, vi, data = d.all, method = "REML")
+d.all$sei <- sqrt(d.all$vi)
+egger_test <- rma(yi, vi, mods = ~ sei, data = d.all, method = "REML")
+# Extract relevant statistics
+intercept_est <- round(egger_test$b[1], 3)
+intercept_se <- round(egger_test$se[1], 3)
+intercept_pval <- ifelse(egger_test$pval[1] < 0.001, "<0.001", round(egger_test$pval[1], 3))
+t_value <- round(egger_test$zval[1], 2)
+ci_lower <- round(egger_test$ci.lb[1], 3)
+ci_upper <- round(egger_test$ci.ub[1], 3)
+
+# Generate markdown text
+egger_results <- paste0(
+  "Egger's test results: The intercept was estimated to be ", intercept_est,
+  " (SE = ", intercept_se, "), with a 95% CI of [", ci_lower, ", ", ci_upper, 
+  "], t(", egger_test$k-1, ") = ", t_value, ", p = ", intercept_pval, "."
+)
+# Print the markdown
+cat(egger_results)
+cat(egger_results, file = pipe("pbcopy"))
+```
+
+# Investigate Variance
+```{r}
+# Perform Egger's test on original data set
+(result <- rma(
+  yi,  # Log-transformed RRs
+  vi,  # Variances of the log-transformed RRs
+  data = d.all,
+  method = "REML"  # For random-effects model
+))
+
+# Perform Egger's test for funnel plot asymmetry
+egger_test <- regtest(result, model = "lm")
+print(egger_test)
+
+# Extract relevant statistics
+t_value <- round(egger_test$zval, 4)
+df <- egger_test$df
+p_value <- ifelse(egger_test$pval < 0.001, "<0.001", round(egger_test$pval, 4))
+
+# Generate markdown text for the test result
+egger_results <- paste0(
+  "Test for Funnel Plot Asymmetry: t = ", t_value, 
+  ", df = ", df, 
+  ", p = ", p_value
+)
+# Print the markdown
+cat(egger_results)
+# Optionally, copy to clipboard using pbcopy (for macOS)
+cat(egger_results, file = pipe("pbcopy"))
+
+# Investigate variance
+plot(d.all$vi, main = "Variances Across Studies", xlab = "Study Index", ylab = "Variance", log = "y")
+
+# Identify the studies with the largest variances
+max_variance <- max(d.all$vi)
+outlier_studies <- d.all[d.all$vi == max_variance, ]
+
+# Print details of the outlier studies
+print(outlier_studies)
+
+# Define a threshold for exclusion (e.g., exclude the top 1% of variances)
+threshold <- quantile(d.all$vi, 0.99)
+d.all_filtered <- d.all[d.all$vi < threshold, ]
+
+# Create a logical index for outliers
+outliers <- d.all$vi >= threshold
+plot(d.all$vi, 
+     main = "Variances Across Studies", 
+     xlab = "Study Index", 
+     ylab = "Variance", 
+     log = "y", 
+     col = ifelse(outliers, "red", "black"),  # Red for outliers, black for others
+     pch = 19)  # Use solid circles for better visibility
+
+
+# Perform Egger's test again on the filtered dataset
+(result <- rma(
+  yi,  # Log-transformed RRs
+  vi,  # Variances of the log-transformed RRs
+  data = d.all_filtered,
+  method = "REML"  # For random-effects model
+))
+
+# Perform Egger's test for funnel plot asymmetry
+egger_test_filtered <- regtest(result, model = "lm")
+print(egger_test_filtered)
+
+# Extract relevant statistics
+t_value <- round(egger_test_filtered$zval, 4)
+df <- egger_test_filtered$df
+p_value <- ifelse(egger_test_filtered$pval < 0.001, "<0.001", round(egger_test_filtered$pval, 4))
+
+# Generate markdown text for the test result
+egger_test_filtered <- paste0(
+  "Test for Funnel Plot Asymmetry: t = ", t_value, 
+  ", df = ", df, 
+  ", p = ", p_value
+)
+
+# Print the markdown
+cat(egger_test_filtered)
+# Optionally, copy to clipboard using pbcopy (for macOS)
+cat(egger_test_filtered, file = pipe("pbcopy"))
+```
+
+# Meta Robu By Substudy
+```{r}
+d.all.byOutcome<- d.all %>% filter(subgroup != 'Combined')
+d.all.byOutcome<- d.all.byOutcome %>% filter(subgroup != 'All Substances')
+( meta.rob = robu( yi ~ 1 + substudy, 
+                   data = d.all.byOutcome, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+print(meta.rob)
+
+# Extract the summary statistics for the model
+extract_robu_results <- function(model) {
+  # Extract the effect size, SE, CI, and p-value
+  Effect_Size <- model$reg_table$b.r
+  SE <- model$reg_table$SE
+  CI_Lower <- model$reg_table$CI.L
+  CI_Upper <- model$reg_table$CI.U
+  P_Value <- model$reg_table$prob
+  
+  # Combine effect size and 95% CI into one column
+  Effect_Size_CI <- paste0(
+    round(Effect_Size, 2), 
+    " (", 
+    round(CI_Lower, 2), 
+    ", ", 
+    round(CI_Upper, 2), 
+    ")"
+  )
+  
+  # Extract model-level statistics
+  Clusters <- model$N
+  Outcomes <- model$M
+  Omega_sq <- model$mod_info$omega.sq
+  Tau_sq <- model$mod_info$tau.sq
+  
+  # Combine all results into a data frame
+  results <- data.frame(
+    Model = c("(Intercept - Alcohol)", "Drugs", "Marijuana", "Smoking"),  # Manually specify model names
+    Effect_Size_CI = Effect_Size_CI,
+    SE = round(SE, 2),
+    P = formatC(P_Value, format = "fg", digits = 2),  # Scientific notation for small p-values
+    Clusters = Clusters,
+    Outcomes = Outcomes,
+    Omega_sq = round(Omega_sq, 4),
+    Tau_sq = round(Tau_sq, 4)
+  )
+  
+  return(results)
+}
+
+# Extract the results for the meta.rob model
+results_for_table <- extract_robu_results(meta.rob)
+
+# Generate the Markdown table text
+markdown_table <- kable(
+  results_for_table, 
+  format = "markdown", 
+  align = c("l", "l", "l", "l", "l", "l", "l", "l")
+)
+
+# Add explicit newlines for proper formatting
+markdown_table_text <- paste0(markdown_table, collapse = "\n")
+
+# Print the Markdown table text to the console
+cat(markdown_table_text)
+
+```
+
+# Sub-Studies
+# Smoking
+```{r}
+( meta.rob.smoking = robu( yi ~ 1,
+                   data = d.smoking, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+print(meta.rob.smoking)
+# Extract effect sizes and standard errors
+effect_sizes <- d.smoking$yi
+standard_errors <- sqrt(d.smoking$vi)
+# Create a funnel plot
+funnel(x = effect_sizes, sei = standard_errors, ylab = "Standard Error", xlab = "Effect Size")
+
+```
+
+# Alcohol
+```{r}
+result <- rma(
+  yi,  # Log-transformed RRs
+  vi,  # Variances of the log-transformed RRs
+  data = d.alcohol,
+  method = "REML"  # For random-effects model
+)
+summary(result)
+forest(result, slab = d.alcohol$authoryear, header = T, font = 'helvetica')
+
+
+( meta.rob.alcohol = robu( yi ~ 1, 
+                   data = d.alcohol, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+```
+
+# Marijuana
+```{r}
+result <- rma(
+  yi,  # Log-transformed RRs
+  vi,  # Variances of the log-transformed RRs
+  data = d.marijuana,
+  method = "REML"  # For random-effects model
+)
+summary(result)
+forest(result, slab = d.marijuana$authoryear, header = T, font = 'helvetica')
+
+( meta.rob.marijuana = robu( yi ~ 1, 
+                   data = d.marijuana, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = FALSE) )
+```
+
+# Drugs
+```{r}
+result <- rma(
+  yi,  # Log-transformed RRs
+  vi,  # Variances of the log-transformed RRs
+  data = d.drugs,
+  method = "REML"  # For random-effects model
+)
+summary(result)
+forest(result, slab = d.drugs$authoryear, header = T, font = 'helvetica')
+
+( meta.rob.drugs = robu( yi ~ 1, 
+                   data = d.drugs, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = FALSE) )
+```
+
+# Substudy Markdown Table
+```{r}
+format_value <- function(x) {
+  if (x < 0.001) {
+    return("<0.001")
+  } else {
+    return(formatC(x, format = "fg", digits = 3))
+  }
+}
+
+# Function to safely extract model results along with additional statistics
+get_model_results <- function(model) {
+  if (!is.null(model$reg_table)) {
+    return(list(
+      Effect_Size = model$reg_table$b.r,  # Extract beta from b.r
+      SE = format_value(model$reg_table$SE),
+      CI_Lower = model$reg_table$CI.L,
+      CI_Upper = model$reg_table$CI.U,
+      P_Value = format_value(model$reg_table$prob),
+      Clusters = model$N,  # Number of clusters
+      Outcomes = model$M,  # Number of outcomes
+      Omega_sq = format_value(model$mod_info$omega.sq),  # Omega squared
+      Tau_sq = format_value(model$mod_info$tau.sq)  # Tau squared
+    ))
+  } else {
+    return(list(
+      Effect_Size = NA,
+      SE = NA,
+      CI_Lower = NA,
+      CI_Upper = NA,
+      P_Value = NA,
+      Clusters = NA,
+      Outcomes = NA,
+      Omega_sq = NA,
+      Tau_sq = NA
+    ))
+  }
+}
+
+# Extract results safely
+alcohol_results <- get_model_results(meta.rob.alcohol)
+drugs_results <- get_model_results(meta.rob.drugs)
+smoking_results <- get_model_results(meta.rob.smoking)
+marijuana_results <- get_model_results(meta.rob.marijuana)
+
+# Create the results data frame
+results <- data.frame(
+  Model = c("Alcohol", "Drugs", "Smoking", "Marijuana"),
+  Effect_Size = c(alcohol_results$Effect_Size, drugs_results$Effect_Size, smoking_results$Effect_Size, marijuana_results$Effect_Size),
+  SE = c(alcohol_results$SE, drugs_results$SE, smoking_results$SE, marijuana_results$SE),
+  CI_Lower = c(alcohol_results$CI_Lower, drugs_results$CI_Lower, smoking_results$CI_Lower, marijuana_results$CI_Lower),
+  CI_Upper = c(alcohol_results$CI_Upper, drugs_results$CI_Upper, smoking_results$CI_Upper, marijuana_results$CI_Upper),
+  P_Value = c(alcohol_results$P_Value, drugs_results$P_Value, smoking_results$P_Value, marijuana_results$P_Value),
+  Clusters = c(alcohol_results$Clusters, drugs_results$Clusters, smoking_results$Clusters, marijuana_results$Clusters),
+  Outcomes = c(alcohol_results$Outcomes, drugs_results$Outcomes, smoking_results$Outcomes, marijuana_results$Outcomes),
+  Omega_sq = c(alcohol_results$Omega_sq, drugs_results$Omega_sq, smoking_results$Omega_sq, marijuana_results$Omega_sq),
+  Tau_sq = c(alcohol_results$Tau_sq, drugs_results$Tau_sq, smoking_results$Tau_sq, marijuana_results$Tau_sq)
+)
+
+# Modify the results to combine Effect Size and 95% CI into one column
+results$Effect_Size_CI <- paste0(
+  round(results$Effect_Size, 2), 
+  " (", 
+  round(results$CI_Lower, 2), 
+  ", ", 
+  round(results$CI_Upper, 2), 
+  ")"
+)
+
+# Select the relevant columns, including the Model column
+results_for_table <- results[, c("Model", "Effect_Size_CI", "SE", "P_Value", "Clusters", "Outcomes", "Omega_sq", "Tau_sq")]
+
+# Rename columns for the table
+colnames(results_for_table) <- c("Model", "Effect Size (95% CI)", "SE", "P", "Clusters", "Outcomes", "Omega.sq", "Tau.sq")
+
+# Generate the Markdown table text
+markdown_table <- kable(
+  results_for_table, 
+  format = "markdown", 
+  align = c("l", "l", "l", "l", "l", "l", "l", "l")
+)
+
+# Add explicit newlines for proper formatting
+markdown_table_text <- paste0(markdown_table, collapse = "\n")
+
+# Print the Markdown table text to the console
+cat(markdown_table_text)
+```
+
+
+
+
+# Exposure Category Analysis
+```{r}
+( meta.rob = robu( yi ~ 1 + exposure, 
+                   data = d.converted, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+
+# Extract relevant statistics
+num_clusters <- meta.rob$N
+num_outcomes <- meta.rob$M
+min_outcomes <- min(meta.rob$studywise_stats$num_outcomes)
+mean_outcomes <- round(mean(meta.rob$studywise_stats$num_outcomes), 2)
+median_outcomes <- median(meta.rob$studywise_stats$num_outcomes)
+max_outcomes <- max(meta.rob$studywise_stats$num_outcomes)
+omega_sq <- formatC(meta.rob$mod_info$omega.sq, format = "fg", digits = 7)
+tau_sq <- formatC(meta.rob$mod_info$tau.sq, format = "fg", digits = 7)
+
+# Extract regression table results
+reg_table <- meta.rob$reg_table %>%
+  mutate(
+    Label = c("R/S", "RSA"),
+    Estimate = formatC(b.r, format = "fg", digits = 3),
+    StdErr = formatC(SE, format = "fg", digits = 3),
+    t_value = formatC(t, format = "fg", digits = 2),
+    p_value = ifelse(prob < 0.001, "<0.001", formatC(prob, format = "e", digits = 2)),
+    CI_Lower = formatC(CI.L, format = "fg", digits = 3),
+    CI_Upper = formatC(CI.U, format = "fg", digits = 3)
+  ) %>%
+  select(Label, Estimate, StdErr, t_value, p_value, CI_Lower, CI_Upper)
+
+# Generate a table summarizing the results
+summary_table <- data.frame(
+  "Number of Clusters" = num_clusters,
+  "Number of Outcomes" = num_outcomes,
+  "Omega.sq" = omega_sq,
+  "Tau.sq" = tau_sq
+)
+
+# Print the summary table
+summary_text <- kable(
+  summary_table,
+  format = "markdown",
+  align = c("l", "r")
+)
+cat(summary_text, "\n")
+
+# Generate the regression results table with labels
+regression_table <- kable(
+  reg_table,
+  format = "markdown",
+  align = c("l", "r", "r", "r", "r", "r", "r"),
+  col.names = c("Label", "Estimate", "StdErr", "t-value", "P(|t|)", "95% CI.L", "95% CI.U")
+)
+
+# Add explicit newlines for proper formatting
+regression_table_text <- paste0(regression_table, collapse = "\n")
+regression_table_text <- gsub("\\n", "\n", regression_table_text)
+
+# Print the regression results table with proper newlines
+cat(regression_table_text, "\n")
+
+```
+
+```{r}
+d.rsa <- d.converted %>% filter(exposure == 'RSA')
+( meta.rob = robu( yi ~ 1, 
+                   data = d.rsa, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+
+d.rs  <- d.converted %>% filter(exposure == 'R/S')
+( meta.rob = robu( yi ~ 1, 
+                   data = d.rs, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+
+
+```
+
+# Bias
+```{r}
+d.all$bias2<- d.all$bias
+d.all$bias2[ grepl('Low',      d.all$bias) ]<- 'Low'
+d.all$bias2[ grepl('Moderate', d.all$bias) ]<- 'Moderate'
+d.all$bias2[ grepl('Serious',  d.all$bias) ]<- 'Serious'
+
+( meta.rob.bias = robu( yi ~ 1 + bias2, 
+                   data = d.all, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+
+# Vectorized helper function to format numbers with 3 significant digits
+# If any value < 0.001, return "<0.001"
+format_value <- function(x) {
+  ifelse(x < 0.001, "<0.001", formatC(x, format = "fg", digits = 3))
+}
+
+# Function to extract and format the robu model results
+extract_robu_results_bias <- function(model) {
+  # Extract the effect size, SE, CI, and p-value
+  Effect_Size <- model$reg_table$b.r
+  SE <- model$reg_table$SE
+  CI_Lower <- model$reg_table$CI.L
+  CI_Upper <- model$reg_table$CI.U
+  P_Value <- model$reg_table$prob
+  
+  # Combine effect size and 95% CI into one column with 3 significant digits
+  Effect_Size_CI <- paste0(
+    round(Effect_Size, 2), 
+    " (", 
+    round(CI_Lower, 2), 
+    ", ", 
+    round(CI_Upper, 2), 
+    ")"
+  )
+  
+  # Extract model-level statistics
+  Clusters <- model$N
+  Outcomes <- model$M
+  Omega_sq <- model$mod_info$omega.sq
+  Tau_sq <- model$mod_info$tau.sq
+  
+  # Combine all results into a data frame
+  results <- data.frame(
+    Model = c("(Intercept - Low Bias)", "Moderate Bias", "Serious Bias"),  # Manually specify model names
+    Effect_Size_CI = Effect_Size_CI,
+    SE = format_value(SE),
+    P = format_value(P_Value),
+    Clusters = Clusters,
+    Outcomes = Outcomes,
+    Omega_sq = format_value(Omega_sq),
+    Tau_sq = format_value(Tau_sq)
+  )
+  
+  return(results)
+}
+
+# Extract the results for the meta.rob model
+results_for_table_bias <- extract_robu_results_bias(meta.rob.bias)
+
+# Generate the Markdown table text
+markdown_table_bias <- kable(
+  results_for_table_bias, 
+  format = "markdown", 
+  align = c("l", "l", "l", "l", "l", "l", "l", "l")
+)
+
+# Add explicit newlines for proper formatting
+markdown_table_bias_text <- paste0(markdown_table_bias, collapse = "\n")
+
+# Print the Markdown table text to the console
+cat(markdown_table_bias_text)
+# Optionally, copy to clipboard using pbcopy (for macOS)
+cat(egger_test_filtered, file = pipe("pbcopy"))
+```
+
+# Headline Analysis
+```{r}
+d.all$headline2 <- grepl('yes', d.all$headline)
+( meta.rob.headline = robu( yi ~ 1 + headline2, 
+                   data = d.all, 
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+
+# Vectorized helper function to format numbers with 3 significant digits
+# If any value < 0.001, return "<0.001"
+format_value <- function(x) {
+  ifelse(x < 0.001, "<0.001", formatC(x, format = "fg", digits = 3))
+}
+
+# Function to extract and format the robu model results
+extract_robu_results_headline <- function(model) {
+  # Extract the effect size, SE, CI, and p-value
+  Effect_Size <- model$reg_table$b.r
+  SE <- model$reg_table$SE
+  CI_Lower <- model$reg_table$CI.L
+  CI_Upper <- model$reg_table$CI.U
+  P_Value <- model$reg_table$prob
+  
+  # Combine effect size and 95% CI into one column with 3 significant digits
+  Effect_Size_CI <- paste0(
+    round(Effect_Size, 2), 
+    " (", 
+    round(CI_Lower, 2), 
+    ", ", 
+    round(CI_Upper, 2), 
+    ")"
+  )
+  
+  # Extract model-level statistics
+  Clusters <- model$N
+  Outcomes <- model$M
+  Omega_sq <- model$mod_info$omega.sq
+  Tau_sq <- model$mod_info$tau.sq
+  
+  # Combine all results into a data frame
+  results <- data.frame(
+    Model = c("(Intercept - No Headline)", "Headline"),  # Manually specify model names
+    Effect_Size_CI = Effect_Size_CI,
+    SE = format_value(SE),
+    P = format_value(P_Value),
+    Clusters = Clusters,
+    Outcomes = Outcomes,
+    Omega_sq = format_value(Omega_sq),
+    Tau_sq = format_value(Tau_sq)
+  )
+  
+  return(results)
+}
+
+# Extract the results for the meta.rob.headline model
+results_for_table_headline <- extract_robu_results_headline(meta.rob.headline)
+
+# Generate the Markdown table text
+markdown_table_headline <- kable(
+  results_for_table_headline, 
+  format = "markdown", 
+  align = c("l", "l", "l", "l", "l", "l", "l", "l")
+)
+
+# Add explicit newlines for proper formatting
+markdown_table_headline_text <- paste0(markdown_table_headline, collapse = "\n")
+
+# Print the Markdown table text to the console
+cat(markdown_table_headline_text)
+
+# Optionally, copy to clipboard using pbcopy (for macOS)
+cat(markdown_table_headline_text, file = pipe("pbcopy"))
+
+
+```
+# Bootstrap
+```{r}
+run_rma_on_subset <- function(data, x_percent) {
+  subset_data <- data[sample(1:nrow(data), size = floor(x_percent * nrow(data))), ]
+  model <- rma(yi, vi, data = subset_data) # Adjust the rma function as needed
+  return(coef(model))
+}
+
+run_robu_on_subset <- function(data, x_percent) {
+  subset_data <- data[sample(1:nrow(data), size = floor(x_percent * nrow(data))), ]
+  #model <- rma(yi, vi, data = subset_data) # Adjust the rma function as needed
+  #return(coef(model))
+  meta.rob = robu( yi ~ 1, 
+                   data = subset_data,
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) 
+  return(meta.rob$b.r)
+}
+
+# Sensitivity analysis parameters
+set.seed(123) # For reproducibility
+x_percentages <- c(0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+n_iterations <- 1000
+results_rma <- list()
+results_robu <- list()
+
+# Run analysis for rma
+for (x in x_percentages) {
+  estimates <- replicate(n_iterations, run_rma_on_subset(d.converted, x))
+  results_rma[[as.character(x)]] <- estimates
+}
+
+# Run analysis for robu
+for (x in x_percentages) {
+  estimates <- replicate(n_iterations, run_robu_on_subset(d.converted, x))
+  results_robu[[as.character(x)]] <- estimates
+}
+
+# Calculate averages and CIs for rma
+avg_estimates_rma <- sapply(results_rma, mean)
+ci_lower_rma <- sapply(results_rma, function(x) quantile(x, 0.025))
+ci_upper_rma <- sapply(results_rma, function(x) quantile(x, 0.975))
+
+# Calculate averages and CIs for robu
+avg_estimates_robu <- sapply(results_robu, mean)
+ci_lower_robu <- sapply(results_robu, function(x) quantile(x, 0.025))
+ci_upper_robu <- sapply(results_robu, function(x) quantile(x, 0.975))
+
+```
+
+# Plot Bootstrap Results
+```{r}
+# Set up the file to save the image
+png("sensitivity_analysis_two_panel.png", width = 10, height = 5, units = "in", res = 300)  # 10 inches wide, 5 inches tall, 300 DPI
+
+# Create a two-panel figure
+par(mfrow = c(1, 2))  # Set up a 1x2 plotting area
+
+# Small offset to use for zero-length arrows
+offset <- 0.001
+
+# Define y-axis limits
+y_limits <- c(-0.25, 0)
+
+# Panel A: Plot for rma
+plot(x_percentages, avg_estimates_rma, ylim=y_limits, type="b",
+     xlab="Percentage of Data", ylab="Effect Size Estimate", main="Panel A: rma")
+for (i in 1:length(x_percentages)) {
+  lower <- ci_lower_rma[i]
+  upper <- ci_upper_rma[i]
+  
+  # Draw arrows if CI is not zero-length
+  if (lower != upper) {
+    arrows(x_percentages[i], lower, x_percentages[i], upper, angle=90, code=3, length=0.1)
+  } else {
+    # Draw a small horizontal line if CI is zero-length
+    segments(x_percentages[i] - offset, lower, x_percentages[i] + offset, upper)
+  }
+}
+
+# Panel B: Plot for robu
+plot(x_percentages, avg_estimates_robu, ylim=y_limits, type="b",
+     xlab="Percentage of Data", ylab="Effect Size Estimate", main="Panel B: robu")
+for (i in 1:length(x_percentages)) {
+  lower <- ci_lower_robu[i]
+  upper <- ci_upper_robu[i]
+  
+  # Draw arrows if CI is not zero-length
+  if (lower != upper) {
+    arrows(x_percentages[i], lower, x_percentages[i], upper, angle=90, code=3, length=0.1)
+  } else {
+    # Draw a small horizontal line if CI is zero-length
+    segments(x_percentages[i] - offset, lower, x_percentages[i] + offset, upper)
+  }
+}
+
+# Close the file to finalize the plot
+dev.off()
+
+
+```
+
+# Worst Case Meta-analysis
+```{r}
+# Subset for non-significant results or effects in the opposite direction
+
+# TODO: go back and add p-values during the etl. For now, doing a simple loop
+d.all$pval<-NA
+for(i in 1:dim(d.all)[1]){
+  ay <- d.all$id[i]
+  found<- df.substance %>% filter( id == ay)
+  p<- found$PValue[1]
+  numericPValue <- as.numeric(gsub("[^0-9.]", "", p))
+  if(substr(p[1], 1, 1) == '>'){
+    print('found a >')
+    numericPValue<- numericPValue+0.01
+    print(numericPValue)
+  }
+  d.all$pval[i]<- numericPValue
+}
+
+
+#d.all$pval <- cleanPValue(d.all$pval)
+
+d.worst_case3<- d.all %>% filter(yi > 0 | pval > 0.05)
+
+
+( meta.rob = robu( yi ~ 1, 
+                   data = d.worst_case3,
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+
+
+```
+
+# Hedge's Selection
+```{r}
+# Compute z-scores
+z_scores <- d.all$yi / sqrt(d.all$vi)
+
+# Compute one-tailed p-values, which is what weightfunct uses
+d.all$pval_one_tailed <- ifelse(
+  d.all$yi >= 0,
+  1 - pnorm(z_scores),
+  pnorm(z_scores)
+)
+hist(d.all$pval_one_tailed, nbins=20)
+
+# Define p-value intervals (use fewer, broader intervals to avoid empty categories)
+p_value_intervals <- c(0.025, 0.10)
+
+# Check how many p-values fall into the interval
+table(cut(d.all$pval, breaks = p_value_intervals, include.lowest = TRUE))
+
+# Define weights for sensitivity analysis
+specified_weights <- c(10, 0.5, 0.5)
+
+# Run the Vevea and Hedges weight-function model
+# Specifiying pvalues and steps results in NaNs
+hedges_model <- weightfunct(
+  effect = d.all$yi,
+  v = d.all$vi,
+  steps = p_value_intervals,
+  pval = d.all$pval_one_tailed,
+  table = TRUE  # Print table of p-value intervals and effect sizes per interval
+)
+(hedges_model)
+
+# PLAYING AROUND WITH DEFINING WEIGHTS
+p_value_intervals <- c(0.025, 0.10)
+specified_weights <- c(10, 0.5, 0.5)
+hedges_model <- weightfunct(
+  effect = d.all$yi,
+  v = d.all$vi,
+  steps = p_value_intervals,
+  pval = d.all$pval_one_tailed,
+  weights = specified_weights,
+  table = TRUE  # Print table of p-value intervals and effect sizes per interval
+)
+(hedges_model)
+
+# From Maya
+temp = rma( yi = d.all$yi,
+           vi = d.all$vi,
+           method = "REML",
+           knha = TRUE )
+metafor::selmodel(temp, type="stepfun", alternative = "greater", steps=c(0.025, 1))
+
+( m1 = weightfunct( effect = d.all$yi,
+                    v = d.all$vi,
+                    steps = c(0.025, 1),
+                    table = TRUE ) )
+(H = m1[[2]]$hessian)
+(ses = sqrt( diag( solve(H) ) ))
+(lrchisq <- 2 * (abs(m1[[1]]$value - m1[[2]]$value)))
+(LR_pval <- 1 - pchisq(lrchisq, 1L))
+# selection ratio
+# index [3] would change for PSM with more cut points
+1/m1$output_adj$par[3]
+
+```
+# MetaUtility
+```{r}
+calibrated<- calib_ests(d.all$yi, sqrt(d.all$vi), method = "DL")
+
+plot(calibrated)
+
+
+```
+
+# "Best"
+```{r}
+d.best <- d.all %>% filter(bias2 != 'Serious')
+d.best <- d.best %>% filter(bias2 != 'Critical')
+d.best <- d.best %>% filter(exposure == 'RSA')
+
+( meta.rob = robu( yi ~ 1, 
+                   data = d.best,
+                   studynum = as.factor(authoryear),
+                   var.eff.size = vi,
+                   modelweights = "HIER",
+                   small = F) )
+
+```
