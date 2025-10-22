@@ -1,0 +1,2175 @@
+# Extract, Transform, and Load for Analysis
+```markdown{Extract, Transform, and Load for Analysis}
+Extract, Transform, Load Effect Sizes for Meta-Analysis
+ 
+This file:
+- loads extracted effects from a public Google Sheet.
+- converts effects sizes as needed
+- exports a formated data frame to be used in meta-analyses
+```
+
+# Load Libraries
+```{r Load Libraries}
+library(tidyverse)
+library(googlesheets4)
+library(meta)
+library(openssl)
+library(gridExtra)
+library(metafor)
+library(robumeta)
+library(knitr)
+library(stargazer)
+```
+
+
+
+# Helper Functions
+```{r Helper Functions}
+# Given Odds Ratios point estimate and confidence intervals, 
+# compute the log-RR.
+oddsRatioWith95CI2RR<- function(est, ciLow, ciHigh){
+  # Compute log-values
+  logOR    <- log(est)
+  logCILow <- log(ciLow)
+  logCIHigh<- log(ciHigh)
+  
+  # Compute SE using both methods
+  SE_low <- (logOR - logCILow) / 1.96
+  SE_high<- (logCIHigh - logOR) / 1.96
+  
+  # Average SE if both are not identical
+  SE <- (SE_high + SE_low) / 2  
+  
+  # Calculate variance
+  logVar <- SE^2
+  
+  # Convert logOR and logVar to log Risk Ratios (RR)
+  results <- lapply(logOR_to_logRR(logOR, logVar), function(x) (x))  
+  
+  return(results)
+}
+
+# Given an Odds Ratio point estimate and its standard error (on the log scale)
+# compute the log-RR
+oddsRatioWithSE2RR<- function(est, se){
+  logOdds <- log(est)
+  ciLow <- exp( logOdds - (1.96 * se) )
+  ciHigh<- exp( logOdds + (1.96 * se) )
+  results<- oddsRatioWith95CI2RR(est, ciLow, ciHigh) 
+  return(results)
+}
+
+# Given a Risk Ratio point estimate and variance, 
+# compute the log-RR.
+# This function is called by:
+# - rrWithSE2LogRR
+# - rrWith95CI2LogRR
+rr2LogRR<- function(yi, vi){
+  logOR<- log(yi)
+  ciLow <- yi - (1.96 * sqrt(vi)) 
+  ciHigh<- yi + (1.96 * sqrt(vi))
+  logCILow <- log(ciLow)
+  logCIHigh<- log(ciHigh)
+  logSE <- (log(ciHigh)-log(ciLow)) / (1.96 * 2)
+  logVar<- logSE ** 2
+  return(list(logOR = logOR, logVar = logVar))
+}
+
+# Given a Risk Ratio point estimate and standard error,
+# compute the log-RR
+rrWithSE2LogRR<- function(est, se){
+  yi <-  est 
+  low<-  est - 1.96*se
+  high<- est + 1.96*se
+  vi<- ((high - low)/(2 * 1.96)) ** 2
+  rr<- rr2LogRR(yi, vi)
+  return(rr)
+}
+
+# Given a Risk Ratio and 95% confidence intervals,
+# compute the log-RR
+rrWith95CI2LogRR<- function(est, low, high){
+  yi<- est
+  vi<- ((low - high)/(2 * 1.96)) ** 2
+  rr<- rr2LogRR(yi, vi)
+  return(rr)  
+}
+
+# Remove any non-numeric characters including <, >, = and then convert to numeric
+cleanPValue <- function(pValue) {
+  numericPValue <- as.numeric(gsub("[^0-9.]", "", pValue))
+  return(numericPValue)
+}
+
+# Invert a point estimate and confidence intervals.
+# Used to keep the 'directionality' consistent across studies.
+invertEstWith95CI <- function(rows){ 
+  new_rows <- rows %>%
+    mutate(
+      new_Stat  = if_else(ToInvert == TRUE, 1 / Stat, Stat),
+      new_CILow = if_else(ToInvert == TRUE, 1 / CIHigh, CILow),
+      new_CIHigh= if_else(ToInvert == TRUE, 1 / CILow, CIHigh)
+    ) %>%
+    select(-Stat, -CILow, -CIHigh) %>%
+    rename(
+      Stat = new_Stat,
+      CILow = new_CILow,
+      CIHigh = new_CIHigh
+    )
+  return(new_rows)
+}
+```
+
+# Get Effect Sizes
+```{r Create Effect Size Data Frame}
+# https://github.com/mayamathur/awr_data_extraction/blob/master/1_get_effect_sizes_from_raw.R
+# trying to emulate the above
+# We define a data frame to collect all of the effect sizes
+# Effect sizes are transformed to log-RR prior to be added to the data frame.
+
+d <- as.data.frame( matrix( ncol = 15, nrow = 0 ) )
+names(d) <- c( "authoryear",
+              "id",
+              "substudy",
+              "desired.direction",
+              "effect.measure",
+              "interpretation",
+              "use.rr.analysis", # Ignore. Not used.
+              "use.grams.analysis", # Ignore. Not used.
+              "use.veg.analysis", # Ignore. Not used.
+              "measure",
+              "exposure",
+              "headline",
+              "bias",
+              "yi",
+              "vi")
+
+# cast data types in the empty data frame to avoid add_row trouble
+d$authoryear     <- as.character(d$authoryear)
+d$id             <- as.character(d$id)
+d$substudy       <- as.character(d$substudy)
+d$interpretation <- as.character(d$interpretation)
+d$effect.measure <- as.character(d$effect.measure)
+d$measure        <- as.character(d$measure)
+d$exposure       <- as.character(d$exposure)
+d$headline       <- as.character(d$headline)
+d$bias           <- as.character(d$bias)
+```
+
+# RRs to log-RRs
+```{r RRs to log-RRs}
+# RRs are already RRs, no need to convert RR. Just transform to log-RR
+
+# Chen and VanderWeele 2018 ###
+# RR with 95% CIs
+authorYear<- "Chen and VanderWeele 2018"
+# NB: There is one OR in this paper that we handle in the OR section below.
+rows <- df.substance %>% filter(AuthorYear == authorYear, StatType == 'RR')
+rr<-rrWith95CI2LogRR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,
+                substudy = rows$OutcomeSubType,
+                exposure = rows$ExposureCategory,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,
+                bias = rows$BiasRating,
+                yi = rr$logOR,
+                vi = rr$logVar
+)                
+
+# Chen et al. 2019 ###
+# RR with 95% CIs
+authorYear<- "Chen et al. 2019"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'RR')
+rr<-rrWith95CI2LogRR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,
+                bias = rows$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar
+)
+
+# Terry-McElrath et al. 2017 ###
+# ARR (adjusted relative risk) with 95% CIs
+# Need to Invert
+authorYear<- "Terry-McElrath et al. 2017"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'AAR')
+rows<- invertEstWith95CI(rows)
+rr <- rrWith95CI2LogRR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,
+                bias = rows$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar 
+)
+
+# Chen et al. 2021b ###
+# RR with 95% CIs
+authorYear<- "Chen et al. 2021b"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'RR')
+rr<-rrWith95CI2LogRR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,
+                bias = rows$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar 
+)
+
+# Long et al. 2020 ###
+# RR with 95% CIs
+authorYear<- "Long et al. 2020"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'RR')
+rr<-rrWith95CI2LogRR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar 
+)
+
+# Shiba et al. 2022 ###
+# RR with 95% CIs
+authorYear<- "Shiba et al. 2022"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'RR')
+rows<- invertEstWith95CI(rows)
+rr<-rrWith95CI2LogRR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar 
+)
+
+# Ruberstein et al. 2021 ###
+# RR with 95% CIs
+authorYear<- "Ruberstein et al. 2021"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'RRR')
+rr<-rrWith95CI2LogRR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar 
+)
+
+```
+
+# ORs to log-RRs 
+```{r ORs to log-RRs}
+# Adamczyk and Felson 2012 ####
+# Odds Ratio
+# No reported error terms
+authorYear<- 'Adamczyk and Felson 2012'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+est<- rows$Stat
+(p <- cleanPValue(rows$PValue))
+(z <- qnorm(1 - p / 2))
+(se<- abs(est / z)) # calculate the SE
+rr<- oddsRatioWithSE2RR(est, se) 
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Bailey et al. 2015 ####
+# Odds Ratio with 95% CIs
+# Need to be inverted
+authorYear<- 'Bailey et al. 2015'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rows<- invertEstWith95CI(rows)
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Burdette et al. 2018 ####
+# Odds Ratio 
+# No reported error terms
+authorYear<- 'Burdette et al. 2018'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+est<- rows$Stat
+p<- cleanPValue(rows$PValue)
+z <- qnorm(1 - p / 2)
+se <- abs(est / z) # calculate the SE
+rr<- oddsRatioWithSE2RR(est, se)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Chen and VanderWeele 2018 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Chen and VanderWeele 2018'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rows<- rows %>% filter(StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Haug et al. 2014 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Haug et al. 2014'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Hill and McCullough 2008 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Hill and McCullough 2008'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Kobayashi et al. 2015 ####
+# Adjusted Odds Ratio with 95% CIs
+authorYear<- 'Kobayashi et al. 2015'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'AOR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Mumford and Liu 2016 ####
+# Adjusted Odds Ratio with 95% CIs
+authorYear<- 'Mumford and Liu 2016'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'AOR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Read et al. 2018 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Read et al. 2018'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Silins et al. 2013 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Silins et al. 2013'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'AOR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Strawbridge et al. 2001 ####
+# Odds Ratio with 95% CIs
+# Need to invert: stop smoking, heavy drinking
+authorYear<- 'Strawbridge et al. 2001'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rows<- invertEstWith95CI(rows)
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Adamczyk and Palmer 2008 ####
+# Odds Ratio with SE
+authorYear<- 'Adamczyk and Palmer 2008'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWithSE2RR(rows$Stat, rows$SE)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Benjamins and Buck 2008 ####
+# Odds Ratio 
+# No error terms
+authorYear<- 'Benjamins and Buck 2008'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+est<- rows$Stat
+p <- cleanPValue(rows$PValue)
+z <- qnorm(1 - p / 2)
+se<- abs(est / z) # calculate the SE
+rr<- oddsRatioWithSE2RR(est, se)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Regnerus et al. 2003 ####
+# Odds Ratio with SE
+authorYear<- 'Regnerus et al. 2003'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWithSE2RR(rows$Stat, rows$SE)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# vandenBree et al. 2004 ####
+# Odds Ratio with 95% CIs
+# Need to invert the discontinued effects
+authorYear<- 'vandenBree et al. 2004'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR' | StatType == 'AOR')
+rows<- rows %>% filter(!is.na(Stat)) # no effect we can't use b/c there is no effect reported
+rows<- invertEstWith95CI(rows)
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Ahrenfeldt et al. 2018 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Ahrenfeldt et al. 2018'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Hill et al. 2017 ####
+# Odds Ratio
+# No error terms reported
+authorYear<- 'Hill et al. 2017'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+est<- rows$Stat
+p <- cleanPValue(rows$PValue)
+z <- qnorm(1 - p / 2)
+se<- abs(est / z) # calculate the SE
+rr<- oddsRatioWithSE2RR(est, se)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Pawlikowski et al. 2019 ####
+# Adjusted Odds Ratio with 95% CIs
+authorYear<- 'Pawlikowski et al. 2019'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'AOR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Tran et al. 2015 ####
+# Adjusted Odds Ratio with 95% CIs
+# Need to invert one effect
+authorYear<- 'Tran et al. 2015'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'AOR')
+rows<- invertEstWith95CI(rows)
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# vandenBree et al. 2005 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'vandenBree et al. 2005'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Whooley et al. 2002 ####
+# Adjusted Odds Ratio with 95% CIs
+# Need to invert
+authorYear<- 'Whooley et al. 2002'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'AOR')
+rows<- invertEstWith95CI(rows)
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Zhang et al. 2018 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Zhang et al. 2018'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Becker et al. 2015 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Becker et al. 2015'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Broman et al. 2020 ####
+# Odds Ratio
+# No error terms
+authorYear<- 'Broman et al. 2020'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+est<- rows$Stat
+p <- cleanPValue(rows$PValue)
+z <- qnorm(1 - p / 2)
+se<- abs(est / z) # calculate the SE
+rr<- oddsRatioWithSE2RR(est, se)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Shiba et al. 2022 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Shiba et al. 2022'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rows<- invertEstWith95CI(rows)
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Hodge et al. 2021 ####
+# Odds Ratio with 95% CIs
+authorYear<- 'Hodge et al. 2021'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Bai 2021 ####
+# Odds Ratio with SE
+authorYear<- 'Bai 2021'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWithSE2RR(rows$Stat, rows$SE)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Wu et al. 2022 ####
+# Odds Ratio with SE
+authorYear<- 'Wu et al. 2022'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'OR')
+rr<- oddsRatioWithSE2RR(rows$Stat, rows$SE)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+```
+
+# Logistic Regressions to OR to log-RR
+```{r Logistic Regressions to OR to log-RR}
+
+# Chu 2012 ####
+# Binary outcome: (0 = marijuana nonuser, 1 = marijuana user)
+# binary logistic regression, reported SE
+authorYear<- 'Chu 2012' 
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'b')
+ciLow <- exp(rows$Stat - (1.96 * rows$SE))
+ciHigh<- exp(rows$Stat + (1.96 * rows$SE))
+est<- exp(rows$Stat) 
+rr <- oddsRatioWith95CI2RR(est, ciLow, ciHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Chu and Sung 2009 ####
+# Logistic Regression
+authorYear<- "Chu and Sung 2009"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'b')
+ciLow <- exp(rows$Stat - (1.96 * rows$SE))
+ciHigh<- exp(rows$Stat + (1.96 * rows$SE))
+est<- exp(rows$Stat) 
+rr <- oddsRatioWith95CI2RR(est, ciLow, ciHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Hill and Pollock 2015 ####
+# Report binary logistic regressions
+# No error terms
+authorYear<- "Hill and Pollock 2015"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+# Authors report a p-value as 0.000, which was encoded in the spreadsheet as
+# 0. We transform them to <0.001
+(p<- as.numeric(rows$PValue))
+(p<- sapply(p, function(x) if (x == 0) 0.001 else x))
+(z<- qnorm(1 - p / 2))
+(se <- abs(est / z)) # calculate the SE
+(est <- exp(rows$Stat))
+rr<- oddsRatioWithSE2RR(est, se)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Mak 2019 ####
+# Logistic regression coefficients with SE
+# Need to invert effect (they are abstain)
+authorYear<- "Mak 2019"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+(est<- 1 / exp(rows$Stat))
+rr<- oddsRatioWithSE2RR(est, rows$SE)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Stansfield 2017 ####
+# Random-effects negative binomial regression models estimating the effect of 
+# religiosity on drug use post-conviction
+# SE reported
+authorYear<- "Stansfield 2017"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'b')
+est<- exp(rows$Stat) 
+rr <- oddsRatioWithSE2RR(est, rows$SE)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Nonnemaker et al. 2006 ####
+# Weighted multinomial logit coefficients 
+# No error terms
+authorYear<- "Nonnemaker et al. 2006"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'b')
+est<- rows$Stat
+p <- cleanPValue(rows$PValue)
+z <- qnorm(1 - p / 2)
+se <- abs(est / z) # calculate the SE
+est<- exp(est) 
+rr <- oddsRatioWithSE2RR(est, se)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Ulmer et al. 2012 ####
+# Multinomial logisitc regression with SE
+authorYear<- "Ulmer et al. 2012"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'b')
+est<- exp(rows$Stat) 
+rr <- oddsRatioWithSE2RR(est, rows$SE)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,               
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Jeynes 2006 ####
+# Authors indicate (pg 5) that they use logistic regressions.
+# The reported results are logistic regressions (logits), we use the
+# usual procedure to go from coeffs -> OR -> logRR
+# Missing error terms, use p-values to estimate errors
+authorYear<- "Jeynes 2006"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+est <- exp(rows$Stat) # logit -> OR
+p  <- cleanPValue(rows$PValue)
+z  <- qnorm(1 - p / 2)
+se <- abs(est / z) # calculate the SE
+est<- exp(rows$Stat) 
+rr <- oddsRatioWithSE2RR(est, se)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+```
+
+# Raw Mean Differences (RMD) to log-RRs
+```{r Convert Raw Mean Differences (RMD) to log-RRs}
+# In this section, we convert non-standardized RMD effects to log-RR by first
+# standardizing the effect.
+
+
+# Mintz et al. 2021 ####
+# Structural Equation Models
+# We treat the path coefficient as a `b` and convert to d then log-RR 
+# (DEF) No mention of standardizing in the text.
+authorYear<- "Mintz et al. 2021"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'b')
+# SDs from Table 1 (Substance Use T4, Spirituality T1)
+# LGB
+sdX<- 1.05
+sdY<- 0.48
+N<-372 
+row<-  rows %>% filter(ModelNumber == 'LGB')
+b  <- row$Stat 
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd) # Table 1 total count 
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Other
+sdX<- 1.10
+sdY<- 0.65 
+N<- 208
+row<- rows %>% filter(ModelNumber == 'Other')
+b  <- row$Stat 
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd) 
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Heterosexual
+sdX<- 0.91
+sdY<- 0.45
+N<- 2164
+row<- rows %>% filter(ModelNumber == 'Hetero')
+b  <- row$Stat # '0' value
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd) 
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Palm et al. 2021 ####
+# Structural Equation Models
+# "Unstandardized coefficients resulting from the best fitting-cross-lagged 
+#   panel mixture model." (pg 4, Fig. 1)
+authorYear<- "Palm et al. 2021"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'b')
+# Majority
+sdX<- 3.03 # Religious Composite Age 16 (Racial) Majority 
+# Any alcohol use at Age 17 reported 30% (of 1858)
+sdY<- sqrt(0.3 * (1- 0.3))
+N<- 1858 # Table 1 total count for (Racial) Majority
+row<-  rows[1,]
+b  <- row$Stat 
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd) # Table 1 total count 
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Minority
+sdX<- 3.18 # Religious Composite Age 16 (Racial) Minority
+sdY<- sqrt(0.55 * (1 - 0.55)) # Any alcohol use at Age 17 reported 30% (of 1858)
+N<- 264 # Table 1 total count for (Racial) Minority
+row<-  rows[2,]
+b  <- row$Stat 
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd) 
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+
+# Upenieks and Schafer 2020 ####
+# OLS regression (unstandardized)
+authorYear<- "Upenieks and Schafer 2020"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'b') 
+# The outcome variables of interest (drinking, smoking) were cumulative scores
+# "Across these four measurement years, we took the average score for 
+# respondents on this variable to create a cumulative measure of smoking....
+# In a similar fashion, we also created a cumulative measures of heavy drinking"
+# Pg 490.
+# We use the stable High -> High (Table 2)
+# Outcome 1 - Smoking
+sdX<- sqrt(0.16*(1-0.16)) # Table 2 - High -> High
+sdY<- 2.54 # of cumulative measure of smoking (pg 490)
+N<- 3609 # Table 2
+b<- rows$Stat[1]
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd) # Table 1 total count 
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id[1],                
+                substudy = rows$OutcomeSubType[1],
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory[1],                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`[1],                
+                bias = rows$BiasRating[1],                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# Outcome 2 - Alcohol 
+sdX<- sqrt(0.16*(1-0.16)) # Table 2 - High -> High
+sdY<- 0.77 # of cumulative measure of heavy drinking (pg 490) 
+N<- 3609 # Table 2
+b  <- rows$Stat[2]
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id[2],                
+                substudy = rows$OutcomeSubType[2],
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory[2],                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`[2],                
+                bias = rows$BiasRating[2],                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+
+# Jang 2019 ####
+# Unstandardized coefficients from multivariate conditional latent growth models
+authorYear<- "Jang 2019"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+# Standard Deviations from Table 1
+# Outcomes: Alcohol, Marijuana
+sdAlcohol   <- 0.47     # Binge drinking FS10 (Time 11) 
+sdMarijuana <- 2.84     # Marijuana use FS10 (Time 11)
+# Treatments: Objective (RSA), Subjective (Religiousness)
+sdRSA <- 1.31 # Objective religiosity Base year survey (Time 1)
+sdRS  <- 1.24 # Subjective religiosity Base year survey (Time 1)
+nAlcohol   <- 1069 # Binge drinking FS10 (Time 11)   
+nMarijuana <- 1069 # Marijuana use FS10 (Time 11)
+
+# RSA -> Alcohol
+row<- rows %>% filter(OutcomeSubType == 'Alcohol' & Exposure == 'Religious Service Attendance')
+b  <- row$Stat
+sdX<- sdRSA
+sdY<- sdAlcohol
+N<- nAlcohol
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# RS -> Alcohol
+row<- rows %>% filter(OutcomeSubType == 'Alcohol' & Exposure == 'Religiousness')
+b  <- row$Stat
+sdX<- sdRS
+sdY<- sdAlcohol
+N<- nAlcohol
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# RSA -> Marijuana
+row<- rows %>% filter(OutcomeSubType == 'Marijuana' & Exposure == 'Religious Service Attendance')
+b  <- row$Stat
+sdX<- sdRSA
+sdY<- sdMarijuana
+N  <- nMarijuana
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# RS -> Marijuana
+row<- rows %>% filter(OutcomeSubType == 'Marijuana' & Exposure == 'Religiousness')
+b  <- row$Stat
+sdX<- sdRS
+sdY<- sdMarijuana
+N  <- nMarijuana
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Fletcher et al. 2014 ####
+# Regression with SEs
+# (def): no mention that coefficients are standardized.
+authorYear<- "Fletcher et al. 2014"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+
+# Standard Deviations from Table 1
+# Outcomes: Smoking, binge drinking, marijuana
+sdSmoking <- 0.47       # W4
+sdBingeDrinking <- 0.50 # W4
+sdMarijuana <- 0.31     # W4
+# Treatments: attendance, frequency of prayer, importance
+sdAttendance <- 1.20           # W1
+sdFreqPrayers <- 1.79          # W1
+sdImportanceOfReligion <- 1.06 # W1
+# Sample Size various by treatment and outcome. To be conservative, we select
+# the sample size from the final wave outcome number.
+nSmoking <- 11592       # W4
+nBingeDrinking <- 11634 # W4
+nMarijuana <- 11669     # W4
+
+# Attendance -> smoking
+row<- rows %>% filter(OutcomeSubType == 'Smoking' & Exposure == 'Religious Service Attendance')
+b  <- row$Stat
+sdX<- sdAttendance
+sdY<- sdSmoking
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# Attendance -> binge drinking
+row<- rows %>% filter(OutcomeSubType == 'Alcohol' & Exposure == 'Religious Service Attendance')
+b  <- row$Stat
+sdX<- sdAttendance
+sdY<- sdBingeDrinking
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# Attendance -> drugs 
+row<- rows %>% filter(OutcomeSubType == 'Drugs' & Exposure == 'Religious Service Attendance')
+b  <- row$Stat
+sdX<- sdAttendance
+sdY<- sdBingeDrinking
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Frequency of Prayer -> Smoking
+row<- rows %>% filter(OutcomeSubType == 'Smoking' & Exposure == 'Prayer (frequency)')
+b  <- row$Stat
+sdX<- sdFreqPrayers
+sdY<- sdSmoking
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# Frequency of Prayer -> Alcohol
+row<- rows %>% filter(OutcomeSubType == 'Alcohol' & Exposure == 'Prayer (frequency)')
+b  <- row$Stat
+sdX<- sdFreqPrayers
+sdY<- sdBingeDrinking
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# Frequency of Prayer -> Drugs
+row<- rows %>% filter(OutcomeSubType == 'Drugs' & Exposure == 'Prayer (frequency)')
+b  <- row$Stat
+sdX<- sdFreqPrayers
+sdY<- sdMarijuana
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Importance of Religion -> Smoking
+row<- rows %>% filter(OutcomeSubType == 'Smoking' & Exposure == 'Importance of Faith')
+b  <- row$Stat
+sdX<- sdImportanceOfReligion
+sdY<- sdSmoking
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# Importance of Religion -> Binge Drinking (Alcohol)
+row<- rows %>% filter(OutcomeSubType == 'Alcohol' & Exposure == 'Importance of Faith')
+b  <- row$Stat
+sdX<- sdImportanceOfReligion
+sdY<- sdBingeDrinking
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+# Importance of Religion -> Marijuana (Drugs)
+row<- rows %>% filter(OutcomeSubType == 'Drugs' & Exposure == 'Importance of Faith')
+b  <- row$Stat
+sdX<- sdImportanceOfReligion
+sdY<- sdMarijuana
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,                
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+```
+
+
+# Standardized Mean Differences (SMD) to log-RRs
+```{r Convert Standardized Mean Differences (SMD) to log-RRs}
+
+# Good and Willoughby 2011 ####
+# Report standardized path coefficients from path analysis
+# No error terms
+# NB: outcome is composite
+authorYear<- "Good and Willoughby 2011"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+N<- 3993 # "The current analysis is based on 3,993 participants..." (pg 684) 
+smd<- rows$Stat
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+
+
+# Hoffmann 2014 ####
+# Standardized coefficients from a structural equation model
+# No error terms reported, but significance level reported as p<0.05
+authorYear<- "Hoffmann 2014"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+N<- 2276 # pg 199 Fig 3 note 
+smd<- rows$Stat
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Wills et al. 2003 ####
+# Multiple regression, methods states that predictors were standardized
+authorYear<- "Wills et al. 2003"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+N<- 1182 #
+smd<- rows$Stat
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+               id = rows$id,                
+               substudy = rows$OutcomeSubType,
+               desired.direction = 1,
+               effect.measure = "log-rr",
+               exposure = rows$ExposureCategory,                                             
+               interpretation = "",
+               use.rr.analysis = 1,
+               use.grams.analysis = 0,
+               use.veg.analysis = 0,
+               measure = "RR",
+               headline = rows$`Finding In Abstract?`,                
+               bias = rows$BiasRating,                
+               yi = rr$logRR,
+               vi = rr$varlogRR
+)
+
+# Nordfjærn 2018 ####
+# Standardized adjusted betas from multiple linear regression for alcohol 
+# consumption levels
+authorYear<- "Nordfjærn 2018"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β')
+rows<- rows %>% filter(StatGrouping == 'sRMD') # Just want the sRMD
+n<- 2671 # pg 2275, Table 1 demographics
+smd<- rows$Stat
+smdVar<- smd_var(N=n, smd = smd) # Table 3 - Model 1 N
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Jang et al. 2008 ####
+# Standardized OLS
+authorYear<- "Jang et al. 2008"
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'β') 
+N<- 1044 # Table 1 total count
+smd<- rows$Stat
+smdVar<- smd_var(N=N, smd = smd)
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,                
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+
+```
+
+# Others
+```{r Other Transformations}
+
+# Hai 2019 ####
+# Marginal Odds Ratio
+authorYear<- "Hai 2019"
+rows<- df.substance %>% filter(AuthorYear == authorYear) 
+rr<-rrWith95CI2LogRR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar
+)
+
+# Sartor et al. 2020 ####
+# Hazard Ratios
+authorYear<- 'Sartor et al. 2020'
+rows<- df.substance %>% filter(AuthorYear == authorYear, StatType == 'HR')
+
+# Alcohol Use 52.8-67.7%
+row <- rows %>% filter(OutcomeSubType == 'Alcohol')
+# Convert to RR
+row$Stat  <- sqrt(row$Stat)
+row$CILow <- sqrt(row$CILow)
+row$CIHigh<- sqrt(row$CIHigh)
+# Convert to log-RR and save
+rr<-rrWith95CI2LogRR(row$Stat, row$CILow, row$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar
+)
+
+# Cigarette Use 26.2-34.7%
+row <- rows %>% filter(OutcomeSubType == 'Smoking')
+# Convert to RR
+row$Stat  <- sqrt(row$Stat)
+row$CILow <- sqrt(row$CILow)
+row$CIHigh<- sqrt(row$CIHigh)
+# Convert to log-RR and save
+rr<-rrWith95CI2LogRR(row$Stat, row$CILow, row$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar
+)
+# Marijuana Use 31.2-41.8% 
+row <- rows %>% filter(OutcomeSubType == 'Marijuana')
+# Convert to RR
+row$Stat  <- sqrt(row$Stat)
+row$CILow <- sqrt(row$CILow)
+row$CIHigh<- sqrt(row$CIHigh)
+# Convert to log-RR and save
+rr<-rrWith95CI2LogRR(row$Stat, row$CILow, row$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logOR,
+                vi = rr$logVar
+)
+
+# Yong et al. 2009
+# OR
+# Need to Invert
+authorYear<- 'Yong et al. 2009'
+rows<- df.substance %>% filter(AuthorYear == authorYear)
+rows<- invertEstWith95CI(rows)
+rr  <- oddsRatioWith95CI2RR(rows$Stat, rows$CILow, rows$CIHigh)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = rows$id,
+                substudy = rows$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = rows$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = rows$`Finding In Abstract?`,                
+                bias = rows$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Mendolia et al. 2019
+# treatment-effect ipwra
+# Assuming that these are not standardized and treating them as RMD
+# Couldn't find needed SDs. Omitting from analysis.
+authorYear<- 'Mendolia et al. 2019'
+rows<- df.substance %>% filter(AuthorYear == authorYear)
+
+# Desmond et al. 2013
+# - should use
+authorYear<- 'Desmond et al. 2013'
+rows<- df.substance %>% filter(AuthorYear == authorYear)
+# Marijuana
+row <- rows %>% filter(OutcomeSubType == 'Marijuana')
+N<- 9460
+sdX<- 3.15 # Table 1
+sdY<- 1.23 # Table 1
+b  <- row$Stat 
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd) # Table 1 total count 
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Alcohol
+row <- rows %>% filter(OutcomeSubType == 'Alcohol')
+N<- 9586
+sdX<- 3.15 # Table 1
+sdY<- 1.31 # Table 1
+b  <- row$Stat 
+smd<- b * (sdX / sdY) 
+smdVar<- smd_var(N=N, smd = smd) # Table 1 total count 
+rr<- d_to_logRR(smd, smdVar)
+rr
+escalc_add_row( authoryear = authorYear,
+                id = row$id,
+                substudy = row$OutcomeSubType,
+                desired.direction = 1,
+                effect.measure = "log-rr",
+                exposure = row$ExposureCategory,                               
+                interpretation = "",
+                use.rr.analysis = 1,
+                use.grams.analysis = 0,
+                use.veg.analysis = 0,
+                measure = "RR",
+                headline = row$`Finding In Abstract?`,                
+                bias = row$BiasRating,                
+                yi = rr$logRR,
+                vi = rr$varlogRR
+)
+
+# Vogelsang and Lariscy 2020
+# IRR; not apparent how to transform; omitting from analysis
+#   
+
+```
+

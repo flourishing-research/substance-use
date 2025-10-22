@@ -1,0 +1,84 @@
+---
+title: "Substance Use Meta-analysis - Load Data"
+output: html_notebook
+---
+
+```{r}
+install.packages("googlesheets4")
+install.packages('tidyverse')
+install.packages('meta')
+install.packages('gridExtra')
+```
+
+```{r}
+library(tidyverse)
+library(googlesheets4)
+library(meta)
+library(openssl)
+library(gridExtra)
+```
+
+```{r}
+# Read the Google Sheet
+#gs4_deauth()
+#sheet_url = "https://docs.google.com/spreadsheets/d/1sVnWATZVDbF4_wmcV-MsRDrZt17JWYTUVkArWPP4Kz8/edit#gid=0"
+#data <- read_sheet(sheet_url, sheet = "Final")
+#df <- data
+#df <- df %>%  mutate(SheetRowNumber = row_number() + 1)
+#df$id <- paste(df$AuthorYear, "-", df$SheetRowNumber)
+#df$id_masked <- factor(substr(md5(df$id), 1, 6))
+```
+# Write to CSV
+```{r}
+df[] <- lapply(df, function(x) {
+  if (is.list(x)) sapply(x, toString) else x
+})
+write.csv(df, "raw_data.csv", row.names = FALSE)
+```
+
+# Write to RData
+```{r}
+save(df, file = "raw_data.RData")
+```
+
+# Load Data (via CSV or RData)
+```{r}
+load("raw_data.RData")
+```
+
+# Summary Tables of Extract Effect Counts
+```{r}
+result_table <- df %>%
+  filter(Include == 'yes') %>%
+  count(OutcomeType, OutcomeSubType,  name = "Count") %>%  # Count unique tuples
+  arrange(OutcomeType, OutcomeSubType, desc(Count))  # Sort the table
+
+# View the result
+print(result_table)
+
+```
+
+# Recode groups
+```{r}
+df$ToInvert[is.na(df$ToInvert)]<- FALSE # Set nulls to false
+df$OutcomeSubType[df$OutcomeSubType == 'Frequent binge drinking']<- 'Alcohol'
+df$OutcomeSubType[df$OutcomeSubType == 'Hard Drugs']<- 'Drugs'
+df$OutcomeSubType[df$OutcomeSubType == 'Other Illicit Drug']<- 'Drugs'
+```
+
+
+# Substance Use
+Make sure we only pull in substance use outcomes. We should not longer need
+this because the raw data was filtered. Keeping for legacy.
+```{r Select Substance Use Outcomes}
+df.substance <- df %>%
+  filter(Include == 'yes', 
+         OutcomeType == 'Substance Use'
+)
+
+```
+
+
+
+
+
